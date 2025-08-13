@@ -4,8 +4,122 @@ import matplotlib.pyplot as plt
 import seaborn as sns 
 import glob 
 import os
-import argparse 
-import cv2
+import argparse
+import cv2 
+from typing import Dict, Tuple, Optional
+
+GRID_N = 16
+CELLS_PER_SIDE = 256
+
+def id_to_grid_position(cellID: int) -> Tuple[int, int]:
+    sid = conversion(cellID)
+    actual_sid = sid - 1
+    row = actual_sid // GRID_N
+    col = actual_sid % GRID_N
+    return int(row), int(col)
+
+def build_grid(percent_map):
+    grids = np.zeros((GRID_N, GRID_N), dtype=np.float32)
+
+    for cellID, pct in percent_map.items(): 
+        row, col = id_to_grid_position(cellID)
+        grids[row, col] = float(pct)
+    return grids
+
+def find_image(image_folder: str, pair: str, side: str) -> Optional[str]:
+    """Return the image path for this pair/side if found, else None."""
+    pair = str(pair).upper().strip()
+    side = side.capitalize().strip()  # "Left"/"Right"
+    num  = '1' if side == 'Left' else '2'
+
+    # Try a few patterns; add more if needed
+    patterns = [
+        os.path.join(image_folder, f"{pair}{num}.*"),        # A1.jpg/png/jpeg
+        os.path.join(image_folder, f"{pair}_{side}.*"),      # A_Left.*
+        os.path.join(image_folder, f"Pair_{pair}_{side}.*"), # Pair_A_Left.*
+        os.path.join(image_folder, f"{pair}-{side}.*"),      # A-Left.*
+    ]
+    exts = (".png", ".jpg", ".jpeg", ".JPG", ".PNG", ".JPEG")
+
+    for pat in patterns:
+        for cand in glob.glob(pat):
+            if cand.endswith(exts) and os.path.exists(cand):
+                return cand
+    return None
+
+def overlay_heatmap_on_image(
+    base_img_path: str,
+    grid: np.ndarray,
+    out_path: str,
+    *,
+    percentile: float = 95.0,
+    blur_kernel: int = 13,
+    alpha_heat: float = 0.6,
+    alpha_img: float  = 0.4
+) -> None:
+    """
+    Convert a 16x16 grid (0..100) to a smooth colored overlay and blend it with the base image.
+    Steps:
+    1) clip by percentile to stabilize contrast
+    2) normalize 0..vmax -> 0..255
+    3) resize to image size (bicubic), gaussian blur
+    4) colorize with JET, alpha-blend onto image
+    """
+    img = cv2.imread(base_img_path, cv2.IMREAD_COLOR)
+    if img is None:
+        raise FileNotFoundError(f"Could not load image: {base_img_path}")
+
+    H, W = img.shape[:2]
+
+    # Robust clipping
+    nz = grid[grid > 0]
+    if nz.size > 0:
+        vmax = np.percentile(nz, percentile)
+        if vmax <= 0:
+            vmax = nz.max() if nz.max() > 0 else 1.0
+    else:
+        vmax = 1.0
+
+    norm = np.clip(grid / vmax, 0.0, 1.0) * 255.0
+    norm = norm.astype(np.uint8)
+
+    # Upscale to image resolution
+    big = cv2.resize(norm, (W, H), interpolation=cv2.INTER_CUBIC)
+
+    # Gentle blur for smoothness (kernel size must be odd)
+    if blur_kernel % 2 == 0:
+        blur_kernel += 1
+    big = cv2.GaussianBlur(big, (blur_kernel, blur_kernel), 0)
+
+    # Colorize
+    heat = cv2.applyColorMap(big, cv2.COLORMAP_JET)
+
+    # Blend
+    overlay = cv2.addWeighted(heat, alpha_heat, img, alpha_img, 0)
+
+    # Save
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    ok = cv2.imwrite(out_path, overlay)
+    if not ok:
+        raise RuntimeError(f"Failed to write {out_path}")
+
+def save_heatmap_only_png(grid: np.ndarray, out_path: str):
+    """
+    Optional: save a heatmap-only image (no base image) in the same resolution as the base,
+    mainly for debugging or documentation. Uses OpenCV coloring (no seaborn).
+    """
+    nz = grid[grid > 0]
+    vmax = np.percentile(nz, 95.0) if nz.size > 0 else 1.0
+    vmax = max(vmax, 1e-6)
+
+    norm = np.clip(grid / vmax, 0.0, 1.0) * 255.0
+    norm = norm.astype(np.uint8)
+    # Scale up to a nice size (e.g., 768×768)
+    big = cv2.resize(norm, (768, 768), interpolation=cv2.INTER_NEAREST)
+    heat = cv2.applyColorMap(big, cv2.COLORMAP_JET)
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    cv2.imwrite(out_path, heat)
+
 
 #helper funciton 
 def parse_cellID_column (pandas_series: pd.Series) -> pd.Series: 
@@ -148,35 +262,6 @@ home = os.path.expanduser('~')
 image_folder = os.path.join(home, 'Downloads', 'gaze_project', 'Images')
 os.makedirs(image_folder, exist_ok=True)
 
-#heatmap generator
-def heatmap_generator(pair, side, mode, out_file, percent_map):
-
-    image_name = os.path.join(image_folder, f"{pair}{1 if side == 'Left' else 2}.JPG")
-
-    if not os.path.exists(image_name): 
-        raise FileNotFoundError(f'{image_name} does not exist. Please try it again.')
-
-    img = cv2.imread(image_name)
-    if img is None: 
-        raise ValueError(f'We failed to load the image')
-
-    grids = np.zeros((16, 16), dtype=np.float32)
-    for cellID, pct in percent_map.items(): 
-        converted_id = conversion(cellID)
-        row = (converted_id - 1) // 16
-        col = (converted_id - 1) % 16
-        grids[row, col] = float(pct)
-
-    grid_255 = np.clip((grids / 100.0) * 255.0, 0, 255).astype(np.uint8)
-
-    h, w = img.shape[:2] #take only the first two values 
-    mask = cv2.resize(grid_255, (w, h), interpolation=cv2.INTER_NEAREST)
-
-    mask = cv2.GaussianBlur(mask, (13, 13), 11)
-    heatmap_img = cv2.applyColorMap(mask, cv2.COLORMAP_JET)
-    super_imposed_img = cv2.addWeighted(heatmap_img, 0.5, img, 0.5, 0)
-    cv2.imwrite(out_file, super_imposed_img)
-    
 #function to batch-analyze files 
 def batcher(input_folder, filtering):
     allfiles = glob.glob(os.path.join(input_folder, 'VR*/**/*.csv'), recursive=True)
@@ -207,16 +292,39 @@ def batcher(input_folder, filtering):
     for (pair, side, mode), sums in totalPercentages.items(): 
         counts = participantCounts[(pair, side, mode)]
         avg = {cellID: round(100 * sums[cellID] / counts[cellID]) for cellID in sums if counts[cellID] > 0} #dictionary where key is cellID and value is an averaged percentage
-        cmap = 'Blues' if mode == 'Frequency' else 'Reds'
-        title = f'{filtering} Pair {pair} {side} {mode.capitalize()}'
-        out_folder = os.path.join(heatmap_folder, f'Pair {pair}') 
-        os.makedirs(out_folder, exist_ok=True)
-        out_file = os.path.join(out_folder, f'{side} {mode}.png')
-        heatmap_generator(pair, side, mode, out_file, percent_map=avg)
-        
-        #create_heatmap(avg, cmap, title, out_file)
 
-    print('Heatmap gerenation is done!')
+        # Build grid
+        grid = build_grid(avg)
+
+        # Output folders
+        out_folder = os.path.join(heatmap_folder, f'Pair_{pair}')
+        os.makedirs(out_folder, exist_ok=True)
+
+        # Try to find base image for the given pair and side
+        base_img_path = find_image(image_folder, pair, side)
+
+        # Always write a heatmap-only PNG (optional, great for QA)
+        debug_heat_path = os.path.join(out_folder, f'{side}_{mode}_HEATMAP.png')
+        save_heatmap_only_png(grid, debug_heat_path)
+
+        if base_img_path is None:
+            print(f"[WARN] No base image for Pair {pair} {side}. Saved heatmap-only at {debug_heat_path}.")
+            continue
+
+        # Overlay on the base image with good quality defaults
+        out_file = os.path.join(out_folder, f'{side}_{mode}_OVERLAY.png')
+        overlay_heatmap_on_image(
+            base_img_path,
+            grid,
+            out_file,
+            percentile=95.0,     # tune: 90–98 is common
+            blur_kernel=13,      # tune: 11–17 for smoothness
+            alpha_heat=0.60,     # heatmap strength
+            alpha_img=0.40       # base-image visibility
+        )
+        print(f"[OK] {pair} {side} {mode} -> {out_file}")
+
+    print('Heatmap generation is done!')
 
 #main function 
 if __name__ == '__main__': 
