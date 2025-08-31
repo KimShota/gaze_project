@@ -67,11 +67,11 @@ def overlay_heatmap_on_image(
     """
     img = cv2.imread(base_img_path, cv2.IMREAD_COLOR)
     if img is None:
-        raise FileNotFoundError(f"Could not load image: {base_img_path}")
+        raise FileNotFoundError(f"I could not load image: {base_img_path}")
 
-    H, W = img.shape[:2]
+    H, W = img.shape[:2] #extract the original height and width of the image 
 
-    # Robust clipping
+    #Only extract non-zero values 
     nz = grid[grid > 0]
     if nz.size > 0:
         vmax = np.percentile(nz, percentile)
